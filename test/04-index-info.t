@@ -16,7 +16,7 @@
 main(_) ->
     test_util:run(9, fun() -> test() end).
 
-sig() -> <<"276df562b152b3c4e5d34024f62672ed">>.
+sig() -> <<"fdf04ef29c4a471f150acad075bdf47f">>.
 
 test() ->
     test_util:start_couch(),
