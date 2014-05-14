@@ -15,10 +15,11 @@
 -export([start_update/3, purge/4, process_doc/3, finish_update/1]).
 
 -include_lib("couch/include/couch_db.hrl").
--include_lib("couch_mrview/include/couch_mrview.hrl").
+-include("couch_mrview.hrl").
 
 
 start_update(Partial, State, NumChanges) ->
+    couch_log:error("Start update", []),
     QueueOpts = [{max_size, 100000}, {max_items, 500}],
     {ok, DocQueue} = couch_work_queue:new(QueueOpts),
     {ok, WriteQueue} = couch_work_queue:new(QueueOpts),
@@ -121,13 +122,17 @@ purge(_Db, PurgeSeq, PurgedIdRevs, State) ->
 
 
 process_doc(Doc, Seq, #mrst{doc_acc=Acc}=State) when length(Acc) > 100 ->
+    couch_log:error("process_doc 1", []),
     couch_work_queue:queue(State#mrst.doc_queue, lists:reverse(Acc)),
     process_doc(Doc, Seq, State#mrst{doc_acc=[]});
 process_doc(nil, Seq, #mrst{doc_acc=Acc}=State) ->
+    couch_log:error("process_doc 2", []),
     {ok, State#mrst{doc_acc=[{nil, Seq, nil} | Acc]}};
 process_doc(#doc{id=Id, deleted=true}, Seq, #mrst{doc_acc=Acc}=State) ->
+    couch_log:error("process_doc 3", []),
     {ok, State#mrst{doc_acc=[{Id, Seq, deleted} | Acc]}};
 process_doc(#doc{id=Id}=Doc, Seq, #mrst{doc_acc=Acc}=State) ->
+    couch_log:error("process_doc 4", []),
     {ok, State#mrst{doc_acc=[{Id, Seq, Doc} | Acc]}}.
 
 
@@ -183,8 +188,8 @@ map_docs(Parent, State0) ->
 
 
 write_results(Parent, State) ->
-    case accumulate_writes(State, State#mrst.write_queue, nil) of
-        stop ->
+    case couch_work_queue:dequeue(State#mrst.write_queue) of
+        closed ->
             Parent ! {new_state, State};
         {Go, {Seq, ViewKVs, DocIdKeys, Log}} ->
             NewState = write_kvs(State, Seq, ViewKVs, DocIdKeys, Log),
@@ -226,16 +231,6 @@ accumulate_writes(State, W, Acc0) ->
             end
     end.
 
-
-accumulate_more(NumDocIds) ->
-    % check if we have enough items now
-    MinItems = config:get("view_updater", "min_writer_items", "100"),
-    MinSize = config:get("view_updater", "min_writer_size", "16777216"),
-    {memory, CurrMem} = process_info(self(), memory),
-    NumDocIds < list_to_integer(MinItems)
-        andalso CurrMem < list_to_integer(MinSize).
-
-
 merge_results([], SeqAcc, ViewKVs, DocIdKeys, Log) ->
     {SeqAcc, ViewKVs, DocIdKeys, Log};
 merge_results([{Seq, Results} | Rest], SeqAcc, ViewKVs, DocIdKeys, Log) ->
@@ -252,6 +247,7 @@ merge_results({DocId, _Seq, []}, ViewKVs, DocIdKeys, Log) ->
     {ViewKVs, [{DocId, []} | DocIdKeys], dict:store(DocId, [], Log)};
 merge_results({DocId, Seq, RawResults}, ViewKVs, DocIdKeys, Log) ->
     JsonResults = couch_query_servers:raw_to_ejson(RawResults),
+    couch_log:error("after! ~p", [JsonResults]),
     Results = [[list_to_tuple(Res) || Res <- FunRs] || FunRs <- JsonResults],
     {ViewKVs1, ViewIdKeys, Log1} = insert_results(DocId, Seq, Results, ViewKVs, [],
                                             [], Log),

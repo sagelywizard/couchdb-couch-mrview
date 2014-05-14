@@ -99,7 +99,7 @@ open(Db, State) ->
     %
     % OldSig is `ok` if no upgrade happened.
     %
-    % To remove suppport for 1.2.x auto-upgrades in the
+    % To remove support for 1.2.x auto-upgrades in the
     % future, just remove the next line and the code
     % between "upgrade code for <= 1.2.x" and
     % "end upgrade code for <= 1.2.x" and the corresponding
@@ -119,9 +119,13 @@ open(Db, State) ->
                 {ok, {Sig, Header}} ->
                     % Matching view signatures.
                     NewSt = couch_mrview_util:init_state(Db, Fd, State, Header),
+                    %{ok, RefCounter} = couch_ref_counter:start([Fd]),
+                    %{ok, NewSt#mrst{refc=RefCounter}};
                     {ok, NewSt#mrst{fd_monitor=erlang:monitor(process, Fd)}};
                 _ ->
                     NewSt = couch_mrview_util:reset_index(Db, Fd, State),
+                    %{ok, RefCounter} = couch_ref_counter:start([Fd]),
+                    %{ok, NewSt#mrst{refc=RefCounter}}
                     {ok, NewSt#mrst{fd_monitor=erlang:monitor(process, Fd)}}
             end;
         {error, Reason} = Error ->

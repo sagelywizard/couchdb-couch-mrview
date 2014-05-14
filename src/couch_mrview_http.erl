@@ -35,10 +35,6 @@
     check_view_etag/3
 ]).
 
--export([parse_boolean/1,
-         parse_int/1,
-         parse_pos_int/1]).
-
 -include_lib("couch/include/couch_db.hrl").
 -include_lib("couch_mrview/include/couch_mrview.hrl").
 
@@ -65,6 +61,18 @@ handle_view_req(#httpd{method='GET',
                       path_parts=[_, _, DDocName, _, VName, <<"_info">>]}=Req,
                 Db, _DDoc) ->
 
+handle_view_req(#httpd{method='GET',
+                       path_parts=[_, _, _, _, VName, <<"_changes">>]}=Req,
+                Db, DDoc) ->
+    ChangesArgs = couch_util:parse_changes_query(Req, Db),
+    ChangesFun = couch_mrview_changes:handle_view_changes(ChangesArgs, Req, Db, DDoc#doc.id, VName),
+    couch_httpd_db:handle_changes(Req, Db, ChangesArgs, ChangesFun);
+
+
+handle_view_req(#httpd{method='GET',
+                      path_parts=[_, _, DDocName, _, VName, <<"_info">>]}=Req,
+                Db, _DDoc) ->
+
     DDocId = <<"_design/", DDocName/binary >>,
     {ok, Info} = couch_mrview:get_view_info(Db#db.name, DDocId, VName),
 
@@ -72,6 +80,8 @@ handle_view_req(#httpd{method='GET',
                  {ddoc, DDocId},
                  {view, VName}] ++ Info,
     couch_httpd:send_json(Req, 200, {FinalInfo});
+
+
 handle_view_req(#httpd{method='GET'}=Req, Db, DDoc) ->
     [_, _, _, _, ViewName] = Req#httpd.path_parts,
     couch_stats_collector:increment({httpd, view_reads}),
@@ -471,6 +481,7 @@ parse_boolean(Val) ->
         Msg = io_lib:format("Invalid boolean parameter: ~p", [Val]),
         throw({query_parse_error, ?l2b(Msg)})
     end.
+
 
 parse_int(Val) when is_integer(Val) ->
     Val;
