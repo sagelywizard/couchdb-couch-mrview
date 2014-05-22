@@ -45,6 +45,7 @@
     seq_btree=nil,
     key_byseq_btree=nil,
     seq_indexed=false,
+    keyseq_indexed=false,
     options=[]
 }).
 

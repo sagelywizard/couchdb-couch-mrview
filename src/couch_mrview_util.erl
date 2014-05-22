@@ -262,20 +262,28 @@ open_view(Db, Fd, Lang, {BTState, SeqBTState, KSeqBTState, USeq, PSeq}, View) ->
     ],
     {ok, Btree} = couch_btree:open(BTState, Fd, ViewBtOpts),
 
-    {SeqBtree, KeyBySeqBtree} = case View#mrview.seq_indexed of
+    BySeqReduceFun = fun couch_db_updater:btree_by_seq_reduce/2,
+
+    SeqBtree = case View#mrview.seq_indexed of
         true ->
-            BySeqReduceFun = fun couch_db_updater:btree_by_seq_reduce/2,
             ViewSeqBtOpts = [{less, fun less_json_seqs/2},
                              {reduce, BySeqReduceFun},
                              {compression, couch_db:compression(Db)}],
+            {ok, SBt} = couch_btree:open(SeqBTState, Fd, ViewSeqBtOpts),
+            SBt;
+        false ->
+            nil
+    end,
+
+    KeyBySeqBtree = case View#mrview.keyseq_indexed of
+        true ->
             KeyBySeqBtOpts = [{less, Less},
                               {reduce, BySeqReduceFun},
                               {compression, couch_db:compression(Db)}],
-            {ok, SBt} = couch_btree:open(SeqBTState, Fd, ViewSeqBtOpts),
             {ok, KSBt} = couch_btree:open(KSeqBTState, Fd, KeyBySeqBtOpts),
-            {SBt, KSBt};
+            KSBt;
         false ->
-            {nil, nil}
+            nil
     end,
 
     View#mrview{btree=Btree,
@@ -558,19 +566,23 @@ make_header(State) ->
         views=Views
     } = State,
 
-    ViewStates = lists:foldr(fun(V, Acc) ->
-                    {SeqBtState, KSeqBtState} = case V#mrview.seq_indexed of
-                        true ->
-                            {couch_btree:get_state(V#mrview.seq_btree),
-                             couch_btree:get_state(V#mrview.key_byseq_btree)};
-                        _ -> {nil, nil}
-                    end,
-                    [{couch_btree:get_state(V#mrview.btree),
-                      SeqBtState,
-                      KSeqBtState,
-                      V#mrview.update_seq,
-                      V#mrview.purge_seq} | Acc]
-            end, [], Views),
+    ViewStates = lists:foldr(fun(View, Acc) ->
+        SeqTree = case View#mrview.seq_indexed of
+            true ->
+                couch_btree:get_state(View#mrview.seq_btree);
+            _ ->
+                nil
+        end,
+        ByKeyTree = case View#mrview.keyseq_indexed of
+            true ->
+                couch_btree:get_state(View#mrview.key_byseq_btree);
+            _ ->
+                nil
+        end,
+        #mrview{btree=Btree, update_seq=UpdateSeq, purge_seq=PurgeSeq} = View,
+        BTState = couch_btree:get_state(Btree),
+        [{BTState, SeqTree, ByKeyTree, UpdateSeq, PurgeSeq} | Acc]
+    end, [], Views),
 
     LogBtreeState = case LogBtree of
         nil -> nil;
@@ -581,7 +593,7 @@ make_header(State) ->
         seq=Seq,
         purge_seq=PurgeSeq,
         id_btree_state=couch_btree:get_state(IdBtree),
-        log_btree_state= LogBtreeState,
+        log_btree_state=LogBtreeState,
         view_states=ViewStates
     }.
 
@@ -754,13 +766,11 @@ changes_ekey_opts(_StartSeq, #mrargs{end_key=EKey,
 
 
 calculate_data_size(IdBt, LogBt, Views) ->
-    SumFun = fun
-        (#mrview{btree=Bt, seq_btree=nil}, Acc) ->
-            sum_btree_sizes(Acc, couch_btree:size(Bt));
-        (#mrview{btree=Bt, seq_btree=SBt, key_byseq_btree=KSBt}, Acc) ->
-            Acc1 = sum_btree_sizes(Acc, couch_btree:size(Bt)),
-            Acc2 = sum_btree_sizes(Acc1, couch_btree:size(SBt)),
-            sum_btree_sizes(Acc2, couch_btree:size(KSBt))
+    SumFun = fun(View, Acc) ->
+        #mrview{btree=Bt, seq_btree=SBt, key_byseq_btree=KSBt} = View,
+        Acc1 = sum_btree_sizes(Acc, couch_btree:size(Bt)),
+        Acc2 = maybe_sum_btree_sizes(Acc1, SBt),
+        maybe_sum_btree_sizes(Acc2, KSBt)
     end,
     Size = case LogBt of
         nil ->
@@ -771,6 +781,10 @@ calculate_data_size(IdBt, LogBt, Views) ->
     end,
     {ok, Size}.
 
+maybe_sum_btree_sizes(Acc, nil) ->
+    Acc;
+maybe_sum_btree_sizes(Acc, Btree) ->
+    sum_btree_sizes(Acc, couch_btree:size(Btree)).
 
 sum_btree_sizes(nil, _) ->
     null;

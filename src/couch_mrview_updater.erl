@@ -93,17 +93,24 @@ purge(_Db, PurgeSeq, PurgedIdRevs, State) ->
             true -> PurgeSeq;
             _ -> View#mrview.purge_seq
         end,
-        {SeqBtree2, KeyBySeqBtree2} = case View#mrview.seq_indexed of
+        SToRem = couch_util:dict_find(ViewId, SeqsToRemove, []),
+        SeqBtree2 = case View#mrview.seq_indexed of
             true ->
-                SToRem = couch_util:dict_find(ViewId, SeqsToRemove, []),
                 SKs = [{Seq, Key} || {Key, Seq, _} <- SToRem],
-                KSs = [{[Seq, Key], DocId} || {Key, Seq, DocId} <- SToRem],
                 {ok, SBt} = couch_btree:add_remove(View#mrview.seq_btree,
                                                    [], SKs),
+                SBt;
+            _ ->
+                nil
+        end,
+        KeyBySeqBtree2 = case View#mrview.keyseq_indexed of
+            true ->
+                KSs = [{[Seq, Key], DocId} || {Key, Seq, DocId} <- SToRem],
                 {ok, KSbt} = couch_btree:add_remove(View#mrview.key_byseq_btree,
                                                     [], KSs),
-                {SBt, KSbt};
-            _ -> {nil, nil}
+                KSbt;
+            _ ->
+                nil
         end,
         View#mrview{btree=VBtree2,
                     seq_btree=SeqBtree2,
@@ -299,27 +306,37 @@ write_kvs(State, UpdateSeq, ViewKVs, DocIdKeys, Log) ->
             _ -> View#mrview.update_seq
         end,
 
-        %% store the view changes.
-        {SeqBtree2, KeyBySeqBtree2} = case View#mrview.seq_indexed of
+        SToAdd = couch_util:dict_find(ViewId, SeqsToAdd, []),
+        SToRem = couch_util:dict_find(ViewId, SeqsToRemove, []),
+        SKVs1 = SKVs ++ SToAdd,
+
+        SeqBtree2 = case View#mrview.seq_indexed of
             true ->
-                SToRem = couch_util:dict_find(ViewId, SeqsToRemove, []),
-                SToAdd = couch_util:dict_find(ViewId, SeqsToAdd, []),
                 RemSKs = [{Seq, Key} || {Key, Seq, _} <- SToRem],
-                RemKSs = [{[Key, Seq], DocId} || {Key, Seq, DocId} <- SToRem],
-                SKVs1 = SKVs ++ SToAdd,
                 {ok, SBt} = couch_btree:add_remove(View#mrview.seq_btree,
                                                    SKVs1, RemSKs),
+                SBt;
+            _ ->
+                nil
+        end,
 
+        KeyBySeqBtree2 = case View#mrview.keyseq_indexed of
+            true ->
+                RemKSs = [{[Key, Seq], DocId} || {Key, Seq, DocId} <- SToRem],
                 {ok, KSbt} = couch_btree:add_remove(View#mrview.key_byseq_btree,
                                                     couch_mrview_util:to_key_seq(SKVs1),
                                                     RemKSs),
-                {SBt, KSbt};
-            _ -> {nil, nil}
+                KSbt;
+            _ ->
+                nil
         end,
-        View#mrview{btree=VBtree2,
-                    seq_btree=SeqBtree2,
-                    key_byseq_btree=KeyBySeqBtree2,
-                    update_seq=NewUpdateSeq}
+
+        View#mrview{
+            btree=VBtree2,
+            seq_btree=SeqBtree2,
+            key_byseq_btree=KeyBySeqBtree2,
+            update_seq=NewUpdateSeq
+        }
     end,
 
     State#mrst{
@@ -340,14 +357,14 @@ update_id_btree(Btree, DocIdKeys, _) ->
     couch_btree:query_modify(Btree, ToFind, ToAdd, ToRem).
 
 walk_log(BTree, Fun, Acc, Ids) ->
-    WrapFun = fun(KV, _Offset, Acc2) ->
-            Fun(KV, Acc2)
+    WrapFun = fun(KV, _Offset, Acc0) ->
+        Fun(KV, Acc0)
     end,
     lists:foldl(fun(Id, Acc1) ->
-                Opt = [{start_key, Id}, {end_key, Id}],
-                {ok, _, A} = couch_btree:fold(BTree, WrapFun, Acc1, Opt),
-                A
-        end, Acc, Ids).
+        Opt = [{start_key, Id}, {end_key, Id}],
+        {ok, _, Acc2} = couch_btree:fold(BTree, WrapFun, Acc1, Opt),
+        Acc2
+    end, Acc, Ids).
 
 update_log(Btree, Log, _UpdatedSeq, true) ->
     ToAdd = [{Id, DIKeys} || {Id, DIKeys} <- dict:to_list(Log),
@@ -356,60 +373,59 @@ update_log(Btree, Log, _UpdatedSeq, true) ->
     {ok, dict:new(), dict:new(), LogBtree2};
 update_log(Btree, Log, UpdatedSeq, _) ->
     %% build list of updated keys and Id
-    {ToLook, Updated} = dict:fold(fun
-                (Id, [], {IdsAcc, KeysAcc}) ->
-                    {[Id | IdsAcc], KeysAcc};
-                (Id, DIKeys, {IdsAcc, KeysAcc}) ->
-                    KeysAcc1 = lists:foldl(fun({ViewId, {Key, _Seq, _Op}},
-                                               KeysAcc2) ->
-                                    [{Id, ViewId, Key} | KeysAcc2]
-                            end, KeysAcc, DIKeys),
-                {[Id | IdsAcc], KeysAcc1} end, {[], []}, Log),
+    {ToLook, Updated} = dict:fold(
+        fun(Id, [], {IdsAcc, KeysAcc}) ->
+            {[Id | IdsAcc], KeysAcc};
+        (Id, DIKeys, {IdsAcc, KeysAcc}) ->
+            KeysAcc1 = lists:foldl(fun({ViewId, {Key, _Seq, _Op}}, KeysAcc2) ->
+                [{Id, ViewId, Key} | KeysAcc2]
+            end, KeysAcc, DIKeys),
+            {[Id | IdsAcc], KeysAcc1}
+        end, {[], []}, Log),
 
     RemValue = {[{<<"_removed">>, true}]},
-    {Log1, AddAcc, DelAcc} = walk_log(Btree, fun({DocId, VIdKeys},
-                                                          {Log2, AddAcc2, DelAcc2}) ->
+    {Log1, AddAcc, DelAcc} = walk_log(Btree,
 
-                {Log3, AddAcc3, DelAcc3} = lists:foldl(fun({ViewId,{Key, Seq, Op}},
-                                                           {Log4, AddAcc4, DelAcc4}) ->
-
-                            case lists:member({DocId, ViewId, Key}, Updated) of
-                                true ->
-                                    %% the log is updated, deleted old
-                                    %% record from the view
-                                    DelAcc5 = dict:append(ViewId,
-                                                          {Key, Seq, DocId},
-                                                          DelAcc4),
-                                    {Log4, AddAcc4, DelAcc5};
-                                false when Op /= del ->
-                                    %% an update operation has been
-                                    %% logged for this key. We must now
-                                    %% record it as deleted in the
-                                    %% log, remove the old record in
-                                    %% the view and update the view
-                                    %% with a removed record.
-                                    Log5 = dict:append(DocId,
-                                                       {ViewId,
-                                                        {Key,UpdatedSeq, del}},
-                                                       Log4),
-                                    DelAcc5 = dict:append(ViewId,
-                                                          {Key, Seq, DocId},
-                                                          DelAcc4),
-                                    AddAcc5 = dict:append(ViewId,
-                                                          {{UpdatedSeq, Key},
-                                                           {DocId, RemValue}},
-                                                          AddAcc4),
-                                    {Log5, AddAcc5, DelAcc5};
-                                false ->
-                                    %% the key has already been
-                                    %% registered in the view as
-                                    %% deleted, make sure to add it
-                                    %% to the new log.
-                                    Log5 = dict:append(DocId,
-                                                       {ViewId,
-                                                        {Key, Seq, del}}, Log4),
-                                    {Log5, AddAcc4, DelAcc4}
-                            end
+        fun({DocId, VIdKeys}, {Log2, AddAcc2, DelAcc2}) ->
+            {Log3, AddAcc3, DelAcc3} = lists:foldl(
+                fun({ViewId,{Key, Seq, Op}}, {Log4, AddAcc4, DelAcc4}) ->
+                    case lists:member({DocId, ViewId, Key}, Updated) of
+                        true ->
+                            %% the log is updated, deleted old
+                            %% record from the view
+                            DelAcc5 = dict:append(ViewId,
+                                                  {Key, Seq, DocId},
+                                                  DelAcc4),
+                            {Log4, AddAcc4, DelAcc5};
+                        false when Op /= del ->
+                            %% an update operation has been
+                            %% logged for this key. We must now
+                            %% record it as deleted in the
+                            %% log, remove the old record in
+                            %% the view and update the view
+                            %% with a removed record.
+                            Log5 = dict:append(DocId,
+                                               {ViewId,
+                                                {Key,UpdatedSeq, del}},
+                                               Log4),
+                            DelAcc5 = dict:append(ViewId,
+                                                  {Key, Seq, DocId},
+                                                  DelAcc4),
+                            AddAcc5 = dict:append(ViewId,
+                                                  {{UpdatedSeq, Key},
+                                                   {DocId, RemValue}},
+                                                  AddAcc4),
+                            {Log5, AddAcc5, DelAcc5};
+                        false ->
+                            %% the key has already been
+                            %% registered in the view as
+                            %% deleted, make sure to add it
+                            %% to the new log.
+                            Log5 = dict:append(DocId,
+                                               {ViewId,
+                                                {Key, Seq, del}}, Log4),
+                            {Log5, AddAcc4, DelAcc4}
+                        end
                     end, {Log2, AddAcc2, DelAcc2}, VIdKeys),
                     {ok, {Log3, AddAcc3, DelAcc3}}
             end, {Log, dict:new(), dict:new()}, ToLook),

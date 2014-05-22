@@ -130,29 +130,39 @@ query_view(Db, {Type, View, Ref}, Args, Callback, Acc) ->
         erlang:demonitor(Ref, [flush])
     end.
 
+% Throws exception if request is for btree which doesn't exist
+get_btree(View, Options) ->
+    case {is_key_byseq(Options), View} of
+        {true, #mrview{keyseq_indexed=true}} ->
+            View#mrview.key_byseq_btree;
+        {false, #mrview{seq_indexed=true}} ->
+            View#mrview.seq_btree;
+        {true, _} ->
+            throw(keyseqs_not_indexed);
+        {false, _} ->
+            throw(seqs_not_indexed)
+    end.
+
 view_changes_since(Db, DDoc, VName, StartSeq, Fun, Acc) ->
     view_changes_since(Db, DDoc, VName, StartSeq, Fun, [], Acc).
 
 view_changes_since(Db, DDoc, VName, StartSeq, Fun, Options, Acc) ->
     Args0 = make_view_changes_args(Options),
-    {ok, {_, View}, _, Args} = couch_mrview_util:get_view(Db, DDoc, VName,
+    {ok, {_, View, _}, _, Args} = couch_mrview_util:get_view(Db, DDoc, VName,
                                                           Args0),
-    case View#mrview.seq_indexed of
-        true ->
+    try get_btree(View, Options) of
+        Btree ->
             OptList = make_view_changes_opts(StartSeq, Options, Args),
-            Btree = case is_key_byseq(Options) of
-                true -> View#mrview.key_byseq_btree;
-                _ -> View#mrview.seq_btree
-            end,
             AccOut = lists:foldl(fun(Opts, Acc0) ->
-                        {ok, _R, A} = couch_mrview_util:fold_changes(
-                                    Btree, Fun, Acc0, Opts),
-                        A
-                end, Acc, OptList),
-            {ok, AccOut};
-        _ ->
-            {error, seqs_not_indexed}
+                {ok, _R, A} = couch_mrview_util:fold_changes(
+                    Btree, Fun, Acc0, Opts),
+                A
+            end, Acc, OptList),
+            {ok, AccOut}
+    catch _:Reason ->
+        {error, Reason}
     end.
+
 
 count_view_changes_since(Db, DDoc, VName, SinceSeq) ->
     count_view_changes_since(Db, DDoc, VName, SinceSeq, []).
@@ -161,24 +171,18 @@ count_view_changes_since(Db, DDoc, VName, SinceSeq, Options) ->
     Args0 = make_view_changes_args(Options),
     {ok, {_, View}, _, Args} = couch_mrview_util:get_view(Db, DDoc, VName,
                                                           Args0),
-    case View#mrview.seq_indexed of
-        true ->
+    try get_btree(View, Options) of
+        Btree ->
             OptList = make_view_changes_opts(SinceSeq, Options, Args),
-            Btree = case is_key_byseq(Options) of
-                true -> View#mrview.key_byseq_btree;
-                _ -> View#mrview.seq_btree
-            end,
             lists:foldl(fun(Opts, Acc0) ->
-                            {ok, N} = couch_btree:fold_reduce(
-                                    Btree, fun(_SeqStart, PartialReds, 0) ->
-                                        {ok, couch_btree:final_reduce(
-                                                    Btree, PartialReds)}
-                                    end,
-                                0, Opts),
-                            Acc0 + N
-                    end, 0, OptList);
-        _ ->
-            {error, seqs_not_indexed}
+                {ok, N} = couch_btree:fold_reduce(Btree,
+                    fun(_SeqStart, PartialReds, 0) ->
+                        {ok, couch_btree:final_reduce(Btree, PartialReds)}
+                    end, 0, Opts),
+                Acc0 + N
+            end, 0, OptList)
+    catch _:Reason ->
+        {error, Reason}
     end.
 
 
@@ -215,6 +219,49 @@ get_view_info(Db, DDoc, VName) ->
           {purge_seq, View#mrview.purge_seq},
           {total_rows, TotalRows},
           {total_seqs, TotalSeqs}]}.
+
+
+%% @doc refresh a view index
+refresh(#db{name=DbName}, DDoc) ->
+    refresh(DbName, DDoc);
+
+refresh(Db, DDoc) ->
+    UpdateSeq = couch_util:with_db(Db, fun(WDb) ->
+                    couch_db:get_update_seq(WDb)
+            end),
+
+    case couch_index_server:get_index(couch_mrview_index, Db, DDoc) of
+        {ok, Pid} ->
+            case catch couch_index:get_state(Pid, UpdateSeq) of
+                {ok, _} -> ok;
+                Error -> {error, Error}
+            end;
+        Error ->
+            {error, Error}
+    end.
+
+%% get informations on a view
+get_view_info(Db, DDoc, VName) ->
+    {ok, {_, View}, _, _Args} = couch_mrview_util:get_view(Db, DDoc, VName,
+                                                          #mrargs{}),
+
+    %% get the total number of rows
+    {ok, TotalRows} =  couch_mrview_util:get_row_count(View),
+
+    %% get the total number of sequence logged in this view
+    SeqBtree = View#mrview.seq_btree,
+    {ok, TotalSeqs} = case SeqBtree of
+        nil -> {ok, 0};
+        _ ->
+            couch_btree:full_reduce(SeqBtree)
+    end,
+
+    {ok, [{seq_indexed, View#mrview.seq_indexed},
+          {update_seq, View#mrview.update_seq},
+          {purge_seq, View#mrview.purge_seq},
+          {total_rows, TotalRows},
+          {total_seqs, TotalSeqs}]}.
+
 
 
 %% @doc refresh a view index

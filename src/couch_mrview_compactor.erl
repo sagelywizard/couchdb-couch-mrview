@@ -186,20 +186,23 @@ compact_view(View, EmptyView, BufferSize, Acc0) ->
                                        View#mrview.id_num,
                                        BufferSize, Acc0),
 
-    %% are we indexing changes by sequences?
-    {NewSeqBt, NewKeyBySeqBt, FinalAcc} = case View#mrview.seq_indexed of
+    {NewSeqBt, Acc2} = case View#mrview.seq_indexed of
         true ->
-            {SBt, Acc2} = compact_view_btree(View#mrview.seq_btree,
-                                             EmptyView#mrview.seq_btree,
-                                             View#mrview.id_num,
-                                             BufferSize, Acc1),
-            {KSBt, Acc3} = compact_view_btree(View#mrview.key_byseq_btree,
-                                              EmptyView#mrview.key_byseq_btree,
-                                              View#mrview.id_num,
-                                              BufferSize, Acc2),
-            {SBt, KSBt, Acc3};
+            compact_view_btree(View#mrview.seq_btree,
+                               EmptyView#mrview.seq_btree,
+                               View#mrview.id_num,
+                               BufferSize, Acc1);
         _ ->
-            {nil, nil, Acc1}
+            {nil, Acc1}
+    end,
+    {NewKeyBySeqBt, FinalAcc} = case View#mrview.keyseq_indexed of
+        true ->
+            compact_view_btree(View#mrview.key_byseq_btree,
+                               EmptyView#mrview.key_byseq_btree,
+                               View#mrview.id_num,
+                               BufferSize, Acc2);
+        _ ->
+            {nil, Acc2}
     end,
     {EmptyView#mrview{btree=NewBt,
                       seq_btree=NewSeqBt,
