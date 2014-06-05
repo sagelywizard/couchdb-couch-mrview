@@ -44,52 +44,37 @@
 
 
 handle_view_changes(ChangesArgs, Req, Db, DDocId, VName) ->
-    %% get view options
-    {Query, NoIndex} = case Req of
-        {json_req, {Props}} ->
-            {Q} = couch_util:get_value(<<"query">>, Props, {[]}),
-            NoIndex1 = (couch_util:get_value(<<"use_index">>, Q,
-                                            <<"yes">>) =:= <<"no">>),
-            {Q, NoIndex1};
-        _ ->
-            NoIndex1 = couch_httpd:qs_value(Req, "use_index", "yes") =:= "no",
-            {couch_httpd:qs(Req), NoIndex1}
-    end,
-    ViewOptions = parse_view_options(Query, []),
+    ViewOptions = parse_view_options(couch_httpd:qs(Req), []),
+    ByKeySeqQuery = couch_mrview_util:is_key_byseq(ViewOptions),
 
     {ok, Infos} = couch_mrview:get_info(Db, DDocId),
     UpdateOptions = proplists:get_value(update_options, Infos, []),
-    IsIndexed = lists:member(<<"seq_indexed">>, UpdateOptions),
-    IsKeyIndexed = lists:member(<<"keyseq_indexed">>, UpdateOptions),
+    SeqIndexed = lists:member(<<"seq_indexed">>, UpdateOptions),
+    KeySeqIndexed = lists:member(<<"keyseq_indexed">>, UpdateOptions),
 
-    case {IsIndexed, NoIndex} of
-        {true, false} ->
-            handle_view_changes(Db, DDocId, VName, ViewOptions, ChangesArgs, Req);
-        {true, true} when ViewOptions /= [] ->
-            ?LOG_ERROR("Tried to filter a non sequence indexed view~n",[]),
-            throw({bad_request, seqs_not_indexed});
-        {false, _} when ViewOptions /= [] ->
-            ?LOG_ERROR("Tried to filter a non sequence indexed view~n",[]),
-            throw({bad_request, seqs_not_indexed});
-        {_, _} ->
-            %% old method we are getting changes using the btree instead
-            %% which is not efficient, log it
-            ?LOG_WARN("Filter without using a seq_indexed view.~n", []),
-            couch_changes:handle_changes(ChangesArgs, Req, Db)
+    if (ByKeySeqQuery and KeySeqIndexed) orelse (SeqIndexed and not ByKeySeqQuery) ->
+        handle_view_changes(Db, DDocId, VName, ViewOptions, ChangesArgs, Req);
+    ByKeySeqQuery ->
+        throw({bad_request, keyseqs_not_indexed});
+    true ->
+        throw({bad_request, seqs_not_indexed})
     end.
 
-handle_view_changes(#db{name=DbName}=Db0, DDocId, VName, ViewOptions,
-                    ChangesArgs, Req) ->
-    #changes_args{
+handle_view_changes(Db0, DDocId, VName, ViewOptions, ChangesArgs, Req) ->
+    #db{name=DbName} = Db0,
+    #changes_args {
         feed = ResponseType,
         since = Since,
-        db_open_options = DbOptions} = ChangesArgs,
+        db_open_options = DbOptions
+    } = ChangesArgs,
 
     Refresh = refresh_option(Req),
 
-    Options0 = [{since, Since},
-                {view_options, ViewOptions},
-                {refresh, Refresh}],
+    Options0 = [
+        {since, Since},
+        {view_options, ViewOptions},
+        {refresh, Refresh}
+    ],
     Options = case ResponseType of
         "continuous" -> [stream | Options0];
         "eventsource" -> [stream | Options0];
@@ -102,7 +87,6 @@ handle_view_changes(#db{name=DbName}=Db0, DDocId, VName, ViewOptions,
     DbOptions1 = [{user_ctx, Db0#db.user_ctx} | DbOptions],
     {ok, Db} = couch_db:open(DbName, DbOptions1),
 
-
     %% initialise the changes fun
     fun(Callback) ->
         Callback(start, ResponseType),
@@ -112,7 +96,6 @@ handle_view_changes(#db{name=DbName}=Db0, DDocId, VName, ViewOptions,
     end.
 
 
-
 %% @doc function returning changes in a streaming fashion if needed.
 -spec go(binary(), binary(), binary(), function(), term(),
                      changes_options()) -> ok | {error, term()}.
@@ -120,7 +103,6 @@ go(DbName, DDocId, View, Fun, Acc, Options) ->
     Since = proplists:get_value(since, Options, 0),
     Stream = proplists:get_value(stream, Options, false),
     ViewOptions = proplists:get_value(view_options, Options, []),
-    %Refresh = proplists:get_value(refresh, Options, false),
 
     State0 = #vst{
         dbname=DbName,
@@ -132,24 +114,20 @@ go(DbName, DDocId, View, Fun, Acc, Options) ->
         acc=Acc
     },
 
-    try
-        case view_changes_since(State0) of
-            {ok, #vst{since=LastSeq, acc=Acc2}=State} ->
-                case Stream of
-                    true ->
-                        start_loop(State#vst{stream=true}, Options);
-                    once when LastSeq =:= Since ->
-                        start_loop(State#vst{stream=once}, Options);
-                    _ ->
-                        Fun(stop, {LastSeq, Acc2})
-                end;
-            {stop, #vst{since=LastSeq, acc=Acc2}} ->
-                Fun(stop, {LastSeq, Acc2});
-            Error ->
-                Error
-        end
-    after
-        ok
+    case view_changes_since(State0) of
+        {ok, #vst{since=LastSeq, acc=Acc2}=State} ->
+            case Stream of
+                true ->
+                    start_loop(State#vst{stream=true}, Options);
+                once when LastSeq =:= Since ->
+                    start_loop(State#vst{stream=once}, Options);
+                _ ->
+                    Fun(stop, {LastSeq, Acc2})
+            end;
+        {stop, #vst{since=LastSeq, acc=Acc2}} ->
+            Fun(stop, {LastSeq, Acc2});
+        Error ->
+            Error
     end.
 
 start_loop(#vst{dbname=DbName, ddoc=DDocId}=State, Options) ->
@@ -253,15 +231,15 @@ index_update_notifier(#db{name=DbName}, DDocId) ->
 index_update_notifier(DbName, DDocId) ->
     Self = self(),
     {ok, NotifierPid} = couch_index_event:start_link(fun
-                ({index_update, {Name, Id, couch_mrview_index}})
-                        when Name =:= DbName, Id =:= DDocId ->
-                    Self ! index_update;
-                ({index_delete, {Name, Id, couch_mrview_index}})
-                        when Name =:= DbName, Id =:= DDocId ->
-                    Self ! index_delete;
-                (_) ->
-                    ok
-            end),
+        ({index_update, {Name, Id, couch_mrview_index}})
+                when Name =:= DbName, Id =:= DDocId ->
+            Self ! index_update;
+        ({index_delete, {Name, Id, couch_mrview_index}})
+                when Name =:= DbName, Id =:= DDocId ->
+            Self ! index_delete;
+        (_) ->
+            ok
+    end),
     NotifierPid.
 
 view_changes_cb(stop, {LastSeq, {_, _, _, Callback, Args}}) ->
@@ -281,12 +259,14 @@ view_changes_cb({{Seq, _Key, DocId}, Val},
 
     #changes_args{
         feed = ResponseType,
-        limit = Limit} = Args,
+        limit = Limit
+    } = Args,
 
     %% if the doc sequence is > to the one in the db record, reopen the
     %% database since it means we don't have the latest db value.
     Db = case Db0#db.update_seq >= Seq of
-        true -> Db0;
+        true ->
+            Db0;
         false ->
             {ok, Db1} = couch_db:reopen_db(Db0),
             Db1
@@ -339,22 +319,22 @@ view_change_row(Db, DocInfo, Args) ->
     end,
 
     {Del, {[{<<"seq">>, Seq}, {<<"id">>, Id}, {<<"changes">>, Changes}] ++
-     deleted_item(Del) ++ case InDoc of
-            true ->
-                Opts = case Conflicts of
-                    true -> [deleted, conflicts];
-                    false -> [deleted]
-                end,
-                Doc = couch_index_util:load_doc(Db, DocInfo, Opts),
-                case Doc of
-                    null ->
-                        [{doc, null}];
-                    _ ->
-%                        [{doc, couch_doc:to_json_obj(Doc, DocOpts)}]
-                        [{doc, couch_doc:to_json_obj(Doc, [])}]
-                end;
-            false ->
-                []
+    deleted_item(Del) ++ case InDoc of
+        true ->
+            Opts = case Conflicts of
+                true -> [deleted, conflicts];
+                false -> [deleted]
+            end,
+            Doc = couch_index_util:load_doc(Db, DocInfo, Opts),
+            case Doc of
+                null ->
+                    [{doc, null}];
+                _ ->
+%                    [{doc, couch_doc:to_json_obj(Doc, DocOpts)}]
+                    [{doc, couch_doc:to_json_obj(Doc, [])}]
+            end;
+        false ->
+            []
     end}}.
 
 parse_view_options([], Acc) ->

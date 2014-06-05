@@ -132,7 +132,7 @@ query_view(Db, {Type, View, Ref}, Args, Callback, Acc) ->
 
 % Throws exception if request is for btree which doesn't exist
 get_btree(View, Options) ->
-    case {is_key_byseq(Options), View} of
+    case {couch_mrview_util:is_key_byseq(Options), View} of
         {true, #mrview{keyseq_indexed=true}} ->
             View#mrview.key_byseq_btree;
         {false, #mrview{seq_indexed=true}} ->
@@ -257,6 +257,7 @@ get_view_info(Db, DDoc, VName) ->
     end,
 
     {ok, [{seq_indexed, View#mrview.seq_indexed},
+          {keyseq_indexed, View#mrview.keyseq_indexed},
           {update_seq, View#mrview.update_seq},
           {purge_seq, View#mrview.purge_seq},
           {total_rows, TotalRows},
@@ -578,14 +579,8 @@ lookup_index(Key) ->
     couch_util:get_value(Key, Index).
 
 
-is_key_byseq(Options) ->
-    lists:any(fun({K, _}) ->
-                lists:member(K, [start_key, end_key, start_key_docid,
-                                 end_key_docid, keys])
-        end, Options).
-
 make_view_changes_args(Options) ->
-    case is_key_byseq(Options) of
+    case couch_mrview_util:is_key_byseq(Options) of
         true ->
             to_mrargs(Options);
         false ->
@@ -593,7 +588,7 @@ make_view_changes_args(Options) ->
     end.
 
 make_view_changes_opts(StartSeq, Options, Args) ->
-    case is_key_byseq(Options) of
+    case couch_mrview_util:is_key_byseq(Options) of
         true ->
             couch_mrview_util:changes_key_opts(StartSeq, Args);
         false ->

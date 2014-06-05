@@ -32,6 +32,7 @@
 -export([changes_key_opts/2]).
 -export([fold_changes/4]).
 -export([to_key_seq/1]).
+-export([is_key_byseq/1]).
 
 -define(MOD, couch_mrview_index).
 
@@ -93,12 +94,13 @@ ddoc_to_mrst(DbName, #doc{id=Id, body={Fields}}) ->
     end,
     {DesignOpts} = proplists:get_value(<<"options">>, Fields, {[]}),
     SeqIndexed = proplists:get_value(<<"seq_indexed">>, DesignOpts, false),
+    KeySeqIndexed = proplists:get_value(<<"keyseq_indexed">>, DesignOpts, false),
 
     {RawViews} = couch_util:get_value(<<"views">>, Fields, {[]}),
     BySrc = lists:foldl(MakeDict, dict:new(), RawViews),
 
     NumViews = fun({_, View}, N) ->
-            {View#mrview{id_num=N, seq_indexed=SeqIndexed}, N+1}
+        {View#mrview{id_num=N, seq_indexed=SeqIndexed, keyseq_indexed=KeySeqIndexed}, N+1}
     end,
     {Views, _} = lists:mapfoldl(NumViews, 0, lists:sort(dict:to_list(BySrc))),
 
@@ -112,7 +114,8 @@ ddoc_to_mrst(DbName, #doc{id=Id, body={Fields}}) ->
         views=Views,
         language=Language,
         design_opts=DesignOpts,
-        seq_indexed=SeqIndexed
+        seq_indexed=SeqIndexed,
+        keyseq_indexed=KeySeqIndexed
     },
     SigInfo = {Views, Language, DesignOpts, couch_index_util:sort_lib(Lib)},
     {ok, IdxState#mrst{sig=couch_util:md5(term_to_binary(SigInfo))}}.
@@ -166,6 +169,7 @@ view_sig(_Db, State, View, Args0) ->
     UpdateSeq = View#mrview.update_seq,
     PurgeSeq = View#mrview.purge_seq,
     SeqIndexed = View#mrview.seq_indexed,
+    SeqIndexed = View#mrview.keyseq_indexed,
     Args = Args0#mrargs{
         preflight_fun=undefined,
         extra=[]
@@ -649,13 +653,16 @@ reset_state(State) ->
     State#mrst{
         fd=nil,
         qserver=nil,
+        log_indexed=State#mrst.log_indexed,
         seq_indexed=State#mrst.seq_indexed,
+        keyseq_indexed=State#mrst.keyseq_indexed,
         update_seq=0,
         id_btree=nil,
         log_btree=nil,
         views=[View#mrview{btree=nil, seq_btree=nil,
                            key_byseq_btree=nil,
-                           seq_indexed=View#mrview.seq_indexed}
+                           seq_indexed=View#mrview.seq_indexed,
+                           keyseq_indexed=View#mrview.keyseq_indexed}
                || View <- State#mrst.views]
     }.
 
@@ -875,6 +882,13 @@ mrverror(Mesg) ->
 
 to_key_seq(L) ->
     [{{[Key, Seq], DocId}, Val} || {{Seq, Key}, {DocId, Val}} <- L].
+
+
+is_key_byseq(Options) ->
+    lists:any(fun({K, _}) ->
+        lists:member(K, [start_key, end_key, start_key_docid,
+                         end_key_docid, keys])
+    end, Options).
 
 %% Updates 1.2.x or earlier view files to 1.3.x or later view files
 %% transparently, the first time the 1.2.x view file is opened by

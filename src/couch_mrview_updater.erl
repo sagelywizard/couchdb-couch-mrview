@@ -293,9 +293,27 @@ write_kvs(State, UpdateSeq, ViewKVs, DocIdKeys, Log) ->
     {ok, ToRemove, IdBtree2} = update_id_btree(IdBtree, DocIdKeys, FirstBuild),
     ToRemByView = collapse_rem_keys(ToRemove, dict:new()),
 
-    {ok, SeqsToAdd, SeqsToRemove, LogBtree2} = case LogBtree of
-        nil -> {ok, undefined, undefined, nil};
-        _ -> update_log(LogBtree, Log, UpdateSeq, FirstBuild)
+    UsesOtherTrees = lists:any(fun(View) ->
+        View#mrview.seq_indexed orelse View#mrview.keyseq_indexed end,
+    State#mrst.views),
+
+    {SeqsToAdd, SeqsToRemove, LogBtree3} = if LogBtree /= nil orelse UsesOtherTrees ->
+        {SeqsToAdd0, SeqsToRemove0, AddToLog} = if FirstBuild ->
+            ToAdd = [{Id, DIKeys} || {Id, DIKeys} <- dict:to_list(Log), DIKeys /= []],
+            {dict:new(), dict:new(), ToAdd};
+        true ->
+            prepare_updates(LogBtree, Log, UpdateSeq)
+        end,
+
+        LogBtree2 = if LogBtree /= nil ->
+            {ok, LogBtree1} = couch_btree:add_remove(LogBtree, AddToLog, []),
+            LogBtree1;
+        true ->
+            nil
+        end,
+        {SeqsToAdd0, SeqsToRemove0, LogBtree2};
+    true ->
+        {undefined, undefined, nil}
     end,
 
     UpdateView = fun(#mrview{id_num=ViewId}=View, {ViewId, {KVs, SKVs}}) ->
@@ -306,9 +324,13 @@ write_kvs(State, UpdateSeq, ViewKVs, DocIdKeys, Log) ->
             _ -> View#mrview.update_seq
         end,
 
-        SToAdd = couch_util:dict_find(ViewId, SeqsToAdd, []),
-        SToRem = couch_util:dict_find(ViewId, SeqsToRemove, []),
-        SKVs1 = SKVs ++ SToAdd,
+        {SToRem, SKVs1} = if View#mrview.seq_indexed orelse View#mrview.keyseq_indexed ->
+            SToAdd = couch_util:dict_find(ViewId, SeqsToAdd, []),
+            SToRem0 = couch_util:dict_find(ViewId, SeqsToRemove, []),
+            {SToRem0, SKVs ++ SToAdd};
+        true ->
+            {nil, nil}
+        end,
 
         SeqBtree2 = case View#mrview.seq_indexed of
             true ->
@@ -343,7 +365,7 @@ write_kvs(State, UpdateSeq, ViewKVs, DocIdKeys, Log) ->
         views=lists:zipwith(UpdateView, State#mrst.views, ViewKVs),
         update_seq=UpdateSeq,
         id_btree=IdBtree2,
-        log_btree=LogBtree2
+        log_btree=LogBtree3
     }.
 
 
@@ -366,12 +388,7 @@ walk_log(BTree, Fun, Acc, Ids) ->
         Acc2
     end, Acc, Ids).
 
-update_log(Btree, Log, _UpdatedSeq, true) ->
-    ToAdd = [{Id, DIKeys} || {Id, DIKeys} <- dict:to_list(Log),
-                             DIKeys /= []],
-    {ok, LogBtree2} = couch_btree:add_remove(Btree, ToAdd, []),
-    {ok, dict:new(), dict:new(), LogBtree2};
-update_log(Btree, Log, UpdatedSeq, _) ->
+prepare_updates(Btree, Log, UpdatedSeq) ->
     %% build list of updated keys and Id
     {ToLook, Updated} = dict:fold(
         fun(Id, [], {IdsAcc, KeysAcc}) ->
@@ -385,7 +402,6 @@ update_log(Btree, Log, UpdatedSeq, _) ->
 
     RemValue = {[{<<"_removed">>, true}]},
     {Log1, AddAcc, DelAcc} = walk_log(Btree,
-
         fun({DocId, VIdKeys}, {Log2, AddAcc2, DelAcc2}) ->
             {Log3, AddAcc3, DelAcc3} = lists:foldl(
                 fun({ViewId,{Key, Seq, Op}}, {Log4, AddAcc4, DelAcc4}) ->
@@ -431,9 +447,7 @@ update_log(Btree, Log, UpdatedSeq, _) ->
             end, {Log, dict:new(), dict:new()}, ToLook),
 
     ToAdd = [{Id, DIKeys} || {Id, DIKeys} <- dict:to_list(Log1), DIKeys /= []],
-    %% store the new logs
-    {ok, LogBtree2} = couch_btree:add_remove(Btree, ToAdd, []),
-    {ok, AddAcc, DelAcc, LogBtree2}.
+    {AddAcc, DelAcc, ToAdd}.
 
 collapse_rem_keys([], Acc) ->
     Acc;

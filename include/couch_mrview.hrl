@@ -19,6 +19,7 @@
     language,
     design_opts=[],
     seq_indexed=false,
+    keyseq_indexed=false,
     lib,
     views,
     id_btree=nil,
