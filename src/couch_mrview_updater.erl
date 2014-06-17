@@ -19,7 +19,6 @@
 
 
 start_update(Partial, State, NumChanges) ->
-    couch_log:error("Start update", []),
     QueueOpts = [{max_size, 100000}, {max_items, 500}],
     {ok, DocQueue} = couch_work_queue:new(QueueOpts),
     {ok, WriteQueue} = couch_work_queue:new(QueueOpts),
@@ -61,14 +60,12 @@ purge(_Db, PurgeSeq, PurgedIdRevs, State) ->
     } = State,
 
     Ids = [Id || {Id, _Revs} <- PurgedIdRevs],
-    {ok, Lookups, LLookups, LogBtree2, IdBtree2} = case LogBtree of
+    {ok, Lookups, IdBtree2} = couch_btree:query_modify(IdBtree, Ids, [], Ids),
+    {ok, LLookups, LogBtree2} = case LogBtree of
         nil ->
-            {ok, L, Bt} = couch_btree:query_modify(IdBtree, Ids, [], Ids),
-            {ok, L, [], nil, Bt};
+            {ok, [], nil};
         _ ->
-            {ok, L, Bt} = couch_btree:query_modify(IdBtree, Ids, [], Ids),
-            {ok, LL, LBt} = couch_btree:query_modify(LogBtree, Ids, [], Ids),
-            {ok, L, LL, LBt, Bt}
+            couch_btree:query_modify(LogBtree, Ids, [], Ids)
     end,
 
     MakeDictFun = fun
@@ -129,17 +126,13 @@ purge(_Db, PurgeSeq, PurgedIdRevs, State) ->
 
 
 process_doc(Doc, Seq, #mrst{doc_acc=Acc}=State) when length(Acc) > 100 ->
-    couch_log:error("process_doc 1", []),
     couch_work_queue:queue(State#mrst.doc_queue, lists:reverse(Acc)),
     process_doc(Doc, Seq, State#mrst{doc_acc=[]});
 process_doc(nil, Seq, #mrst{doc_acc=Acc}=State) ->
-    couch_log:error("process_doc 2", []),
     {ok, State#mrst{doc_acc=[{nil, Seq, nil} | Acc]}};
 process_doc(#doc{id=Id, deleted=true}, Seq, #mrst{doc_acc=Acc}=State) ->
-    couch_log:error("process_doc 3", []),
     {ok, State#mrst{doc_acc=[{Id, Seq, deleted} | Acc]}};
 process_doc(#doc{id=Id}=Doc, Seq, #mrst{doc_acc=Acc}=State) ->
-    couch_log:error("process_doc 4", []),
     {ok, State#mrst{doc_acc=[{Id, Seq, Doc} | Acc]}}.
 
 
@@ -195,8 +188,8 @@ map_docs(Parent, State0) ->
 
 
 write_results(Parent, State) ->
-    case couch_work_queue:dequeue(State#mrst.write_queue) of
-        closed ->
+    case accumulate_writes(State, State#mrst.write_queue, nil) of
+        stop ->
             Parent ! {new_state, State};
         {Go, {Seq, ViewKVs, DocIdKeys, Log}} ->
             NewState = write_kvs(State, Seq, ViewKVs, DocIdKeys, Log),
@@ -238,6 +231,14 @@ accumulate_writes(State, W, Acc0) ->
             end
     end.
 
+accumulate_more(NumDocIds) ->
+    % check if we have enough items now
+    MinItems = config:get("view_updater", "min_writer_items", "100"),
+    MinSize = config:get("view_updater", "min_writer_size", "16777216"),
+    {memory, CurrMem} = process_info(self(), memory),
+    NumDocIds < list_to_integer(MinItems)
+        andalso CurrMem < list_to_integer(MinSize).
+
 merge_results([], SeqAcc, ViewKVs, DocIdKeys, Log) ->
     {SeqAcc, ViewKVs, DocIdKeys, Log};
 merge_results([{Seq, Results} | Rest], SeqAcc, ViewKVs, DocIdKeys, Log) ->
@@ -254,7 +255,6 @@ merge_results({DocId, _Seq, []}, ViewKVs, DocIdKeys, Log) ->
     {ViewKVs, [{DocId, []} | DocIdKeys], dict:store(DocId, [], Log)};
 merge_results({DocId, Seq, RawResults}, ViewKVs, DocIdKeys, Log) ->
     JsonResults = couch_query_servers:raw_to_ejson(RawResults),
-    couch_log:error("after! ~p", [JsonResults]),
     Results = [[list_to_tuple(Res) || Res <- FunRs] || FunRs <- JsonResults],
     {ViewKVs1, ViewIdKeys, Log1} = insert_results(DocId, Seq, Results, ViewKVs, [],
                                             [], Log),
@@ -263,24 +263,26 @@ merge_results({DocId, Seq, RawResults}, ViewKVs, DocIdKeys, Log) ->
 
 insert_results(DocId, _Seq, [], [], ViewKVs, ViewIdKeys, Log) ->
     {lists:reverse(ViewKVs), {DocId, ViewIdKeys}, Log};
-insert_results(DocId, Seq, [KVs | RKVs], [{Id, {VKVs, SKVs}} | RVKVs], VKVAcc,
-               VIdKeys, Log) ->
+insert_results(DocId, Seq, [KVs | RKVs], [{Id, {VKVs, SKVs}} | RVKVs], VKVAcc, VIdKeys, Log) ->
+    % Takes a sorted list of {EmittedKey, EmittedValue}.
+    % Returns:
+    % 1) A tuple where the first elem is EmittedKey and the value is either the
+    % EmittedValue or {dups, [EmittedValue]}
+    % 2) [{ViewID, EmittedKey}]
+    % 3) dict(DocID, {ViewID, {EmittedKey, Seq, Op}})
     CombineDupesFun = fun
         ({Key, Val}, {[{Key, {dups, Vals}} | Rest], IdKeys, Log2}) ->
             {[{Key, {dups, [Val | Vals]}} | Rest], IdKeys, Log2};
         ({Key, Val1}, {[{Key, Val2} | Rest], IdKeys, Log2}) ->
             {[{Key, {dups, [Val1, Val2]}} | Rest], IdKeys, Log2};
         ({Key, _}=KV, {Rest, IdKeys, Log2}) ->
-            {[KV | Rest], [{Id, Key} | IdKeys],
-             dict:append(DocId, {Id, {Key, Seq, add}}, Log2)}
+            {[KV | Rest], [{Id, Key} | IdKeys], dict:append(DocId, {Id, {Key, Seq, add}}, Log2)}
     end,
     InitAcc = {[], VIdKeys, Log},
-    {Duped, VIdKeys0, Log1} = lists:foldl(CombineDupesFun, InitAcc,
-                                          lists:sort(KVs)),
+    {Duped, VIdKeys0, Log1} = lists:foldl(CombineDupesFun, InitAcc, lists:sort(KVs)),
     FinalKVs = [{{Key, DocId}, Val} || {Key, Val} <- Duped] ++ VKVs,
     FinalSKVs = [{{Seq, Key}, {DocId, Val}} || {Key, Val} <- Duped] ++ SKVs,
-    insert_results(DocId, Seq, RKVs, RVKVs,
-                  [{Id, {FinalKVs, FinalSKVs}} | VKVAcc], VIdKeys0, Log1).
+    insert_results(DocId, Seq, RKVs, RVKVs, [{Id, {FinalKVs, FinalSKVs}} | VKVAcc], VIdKeys0, Log1).
 
 
 write_kvs(State, UpdateSeq, ViewKVs, DocIdKeys, Log) ->
@@ -293,27 +295,20 @@ write_kvs(State, UpdateSeq, ViewKVs, DocIdKeys, Log) ->
     {ok, ToRemove, IdBtree2} = update_id_btree(IdBtree, DocIdKeys, FirstBuild),
     ToRemByView = collapse_rem_keys(ToRemove, dict:new()),
 
-    UsesOtherTrees = lists:any(fun(View) ->
-        View#mrview.seq_indexed orelse View#mrview.keyseq_indexed end,
-    State#mrst.views),
+    couch_log:error("LogBtree: ~p", [LogBtree]),
+    {SeqsToAdd, SeqsToRemove, LogBtree3} = case LogBtree of
+        nil ->
+            {undefined, undefined, nil};
+        _ ->
+            {SeqsToAdd0, SeqsToRemove0, AddToLog} = if FirstBuild ->
+                ToAdd = [{Id, DIKeys} || {Id, DIKeys} <- dict:to_list(Log), DIKeys /= []],
+                {dict:new(), dict:new(), ToAdd};
+            true ->
+                prepare_updates(LogBtree, Log, UpdateSeq)
+            end,
 
-    {SeqsToAdd, SeqsToRemove, LogBtree3} = if LogBtree /= nil orelse UsesOtherTrees ->
-        {SeqsToAdd0, SeqsToRemove0, AddToLog} = if FirstBuild ->
-            ToAdd = [{Id, DIKeys} || {Id, DIKeys} <- dict:to_list(Log), DIKeys /= []],
-            {dict:new(), dict:new(), ToAdd};
-        true ->
-            prepare_updates(LogBtree, Log, UpdateSeq)
-        end,
-
-        LogBtree2 = if LogBtree /= nil ->
             {ok, LogBtree1} = couch_btree:add_remove(LogBtree, AddToLog, []),
-            LogBtree1;
-        true ->
-            nil
-        end,
-        {SeqsToAdd0, SeqsToRemove0, LogBtree2};
-    true ->
-        {undefined, undefined, nil}
+            {SeqsToAdd0, SeqsToRemove0, LogBtree1}
     end,
 
     UpdateView = fun(#mrview{id_num=ViewId}=View, {ViewId, {KVs, SKVs}}) ->
@@ -332,25 +327,25 @@ write_kvs(State, UpdateSeq, ViewKVs, DocIdKeys, Log) ->
             {nil, nil}
         end,
 
-        SeqBtree2 = case View#mrview.seq_indexed of
+        {ok, SeqBtree2} = case View#mrview.seq_indexed of
             true ->
                 RemSKs = [{Seq, Key} || {Key, Seq, _} <- SToRem],
-                {ok, SBt} = couch_btree:add_remove(View#mrview.seq_btree,
-                                                   SKVs1, RemSKs),
-                SBt;
+                couch_btree:add_remove(View#mrview.seq_btree, SKVs1, RemSKs);
             _ ->
-                nil
+                {ok, nil}
         end,
 
-        KeyBySeqBtree2 = case View#mrview.keyseq_indexed of
+        {ok, KeyBySeqBtree2} = case View#mrview.keyseq_indexed of
             true ->
                 RemKSs = [{[Key, Seq], DocId} || {Key, Seq, DocId} <- SToRem],
-                {ok, KSbt} = couch_btree:add_remove(View#mrview.key_byseq_btree,
-                                                    couch_mrview_util:to_key_seq(SKVs1),
-                                                    RemKSs),
-                KSbt;
+                couch_log:error("couch_mrview_util:to_key_seq(SKVs1): ~p", [couch_mrview_util:to_key_seq(SKVs1)]),
+                couch_log:error("RemKSs: ~p", [RemKSs]),
+                couch_btree:add_remove(View#mrview.key_byseq_btree,
+                                       couch_mrview_util:to_key_seq(SKVs1),
+                                       RemKSs);
             _ ->
-                nil
+                couch_log:error("keyseq nil?", []),
+                {ok, nil}
         end,
 
         View#mrview{

@@ -132,6 +132,7 @@ query_view(Db, {Type, View, Ref}, Args, Callback, Acc) ->
 
 % Throws exception if request is for btree which doesn't exist
 get_btree(View, Options) ->
+    couch_log:error("Here's a view: ~p", [View]),
     case {couch_mrview_util:is_key_byseq(Options), View} of
         {true, #mrview{keyseq_indexed=true}} ->
             View#mrview.key_byseq_btree;
@@ -198,29 +199,6 @@ trigger_update(Db, DDoc, UpdateSeq) ->
     {ok, Pid} = couch_index_server:get_index(couch_mrview_index, Db, DDoc),
     couch_index:trigger_update(Pid, UpdateSeq).
 
-%% get informations on a view
-get_view_info(Db, DDoc, VName) ->
-    {ok, {_, View}, _, _Args} = couch_mrview_util:get_view(Db, DDoc, VName,
-                                                          #mrargs{}),
-
-    %% get the total number of rows
-    {ok, TotalRows} =  couch_mrview_util:get_row_count(View),
-
-    %% get the total number of sequence logged in this view
-    SeqBtree = View#mrview.seq_btree,
-    {ok, TotalSeqs} = case SeqBtree of
-        nil -> {ok, 0};
-        _ ->
-            couch_btree:full_reduce(SeqBtree)
-    end,
-
-    {ok, [{seq_indexed, View#mrview.seq_indexed},
-          {update_seq, View#mrview.update_seq},
-          {purge_seq, View#mrview.purge_seq},
-          {total_rows, TotalRows},
-          {total_seqs, TotalSeqs}]}.
-
-
 %% @doc refresh a view index
 refresh(#db{name=DbName}, DDoc) ->
     refresh(DbName, DDoc);
@@ -263,26 +241,6 @@ get_view_info(Db, DDoc, VName) ->
           {total_rows, TotalRows},
           {total_seqs, TotalSeqs}]}.
 
-
-
-%% @doc refresh a view index
-refresh(#db{name=DbName}, DDoc) ->
-    refresh(DbName, DDoc);
-
-refresh(Db, DDoc) ->
-    UpdateSeq = couch_util:with_db(Db, fun(WDb) ->
-                    couch_db:get_update_seq(WDb)
-            end),
-
-    case couch_index_server:get_index(couch_mrview_index, Db, DDoc) of
-        {ok, Pid} ->
-            case catch couch_index:get_state(Pid, UpdateSeq) of
-                {ok, _} -> ok;
-                Error -> {error, Error}
-            end;
-        Error ->
-            {error, Error}
-    end.
 
 compact(Db, DDoc) ->
     compact(Db, DDoc, []).

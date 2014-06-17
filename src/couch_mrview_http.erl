@@ -19,7 +19,8 @@
     handle_temp_view_req/2,
     handle_info_req/3,
     handle_compact_req/3,
-    handle_cleanup_req/2
+    handle_cleanup_req/2,
+    handle_view_changes_req/3
 ]).
 
 -export([
@@ -57,16 +58,14 @@ handle_reindex_req(Req, _Db, _DDoc) ->
     couch_httpd:send_method_not_allowed(Req, "POST").
 
 
-handle_view_req(#httpd{method='GET',
-                      path_parts=[_, _, DDocName, _, VName, <<"_info">>]}=Req,
-                Db, _DDoc) ->
-
-handle_view_req(#httpd{method='GET',
-                       path_parts=[_, _, _, _, VName, <<"_changes">>]}=Req,
-                Db, DDoc) ->
+handle_view_changes_req(#httpd{method='GET',
+                               path_parts=[_, _, VName, <<"_changes">>]}=Req,
+                        Db, DDoc) ->
     ChangesArgs = couch_util:parse_changes_query(Req, Db),
     ChangesFun = couch_mrview_changes:handle_view_changes(ChangesArgs, Req, Db, DDoc#doc.id, VName),
     couch_httpd_db:handle_changes(Req, Db, ChangesArgs, ChangesFun);
+handle_view_changes_req(Req, _Db, _DDoc) ->
+    couch_httpd:send_method_not_allowed(Req, "GET").
 
 
 handle_view_req(#httpd{method='GET',

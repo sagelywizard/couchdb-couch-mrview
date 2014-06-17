@@ -48,10 +48,13 @@ handle_view_changes(ChangesArgs, Req, Db, DDocId, VName) ->
     ByKeySeqQuery = couch_mrview_util:is_key_byseq(ViewOptions),
 
     {ok, Infos} = couch_mrview:get_info(Db, DDocId),
+    couch_log:error("Infos: ~p", [Infos]),
     UpdateOptions = proplists:get_value(update_options, Infos, []),
     SeqIndexed = lists:member(<<"seq_indexed">>, UpdateOptions),
     KeySeqIndexed = lists:member(<<"keyseq_indexed">>, UpdateOptions),
 
+    couch_log:error("(ByKeySeqQuery and KeySeqIndexed) orelse (SeqIndexed and not ByKeySeqQuery)", []),
+    couch_log:error("(~p and ~p) orelse (~p and not ~p)", [ByKeySeqQuery, KeySeqIndexed, SeqIndexed, ByKeySeqQuery]),
     if (ByKeySeqQuery and KeySeqIndexed) orelse (SeqIndexed and not ByKeySeqQuery) ->
         handle_view_changes(Db, DDocId, VName, ViewOptions, ChangesArgs, Req);
     ByKeySeqQuery ->
@@ -415,4 +418,3 @@ parse_json(V) ->
 
 deleted_item(true) -> [{<<"deleted">>, true}];
 deleted_item(_) -> [].
->>>>>>> f4a208a... gonna do some crazy git-foo later

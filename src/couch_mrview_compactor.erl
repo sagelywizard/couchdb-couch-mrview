@@ -42,6 +42,7 @@ compact(State) ->
         id_btree=IdBtree,
         log_btree=LogBtree,
         seq_indexed=SeqIndexed,
+        keyseq_indexed=KeySeqIndexed,
         views=Views
     } = State,
 
@@ -62,20 +63,23 @@ compact(State) ->
         views = EmptyViews
     } = EmptyState,
 
-    TotalChanges0 = case SeqIndexed of
-        true -> NumDocIds * 2;
-        _ -> NumDocIds
+    TotalChanges0 = case LogBtree of
+        nil -> NumDocIds;
+        _ -> NumDocIds * 2
     end,
 
     TotalChanges = lists:foldl(
         fun(View, Acc) ->
             {ok, Kvs} = couch_mrview_util:get_row_count(View),
-            case SeqIndexed of
-                true ->
-                    {ok, SKvs} = couch_mrview_util:get_view_changes_count(View),
-                    Acc + Kvs + SKvs * 2;
-                false ->
-                    Acc + Kvs
+            {ok, SKvs} = if SeqIndexed orelse KeySeqIndexed ->
+                couch_mrview_util:get_view_changes_count(View);
+            true ->
+                {ok, 0}
+            end,
+            if SeqIndexed andalso KeySeqIndexed ->
+                Acc + Kvs + SKvs * 2;
+            true ->
+                Acc + Kvs + SKvs
             end
         end,
         TotalChanges0, Views),
@@ -122,14 +126,14 @@ compact(State) ->
     FinalAcc2 = update_task(FinalAcc, length(Uncopied)),
 
 
-    {NewLogBtree, FinalAcc3} = case SeqIndexed of
-        true ->
+    {NewLogBtree, FinalAcc3} = case LogBtree of
+        nil ->
+            {nil, FinalAcc2};
+        _ ->
             compact_log(LogBtree, BufferSize,
                         FinalAcc2#acc{kvs=[],
                                       kvs_size=0,
-                                      btree=EmptyLogBtree});
-        _ ->
-            {nil, FinalAcc2}
+                                      btree=EmptyLogBtree})
     end,
 
     {NewViews, _} = lists:mapfoldl(fun({View, EmptyView}, Acc) ->

@@ -160,7 +160,7 @@ view_sig(Db, State, View, #mrargs{include_docs=true}=Args) ->
     UpdateSeq = couch_db:get_update_seq(Db),
     PurgeSeq = couch_db:get_purge_seq(Db),
     Bin = term_to_binary({BaseSig, UpdateSeq, PurgeSeq,
-                          State#mrst.seq_indexed}),
+                          State#mrst.seq_indexed, State#mrst.keyseq_indexed}),
     couch_index_util:hexsig(couch_util:md5(Bin));
 view_sig(Db, State, {_Nth, _Lang, View}, Args) ->
     view_sig(Db, State, View, Args);
@@ -169,12 +169,12 @@ view_sig(_Db, State, View, Args0) ->
     UpdateSeq = View#mrview.update_seq,
     PurgeSeq = View#mrview.purge_seq,
     SeqIndexed = View#mrview.seq_indexed,
-    SeqIndexed = View#mrview.keyseq_indexed,
+    KeySeqIndexed = View#mrview.keyseq_indexed,
     Args = Args0#mrargs{
         preflight_fun=undefined,
         extra=[]
     },
-    Bin = term_to_binary({Sig, UpdateSeq, PurgeSeq, SeqIndexed, Args}),
+    Bin = term_to_binary({Sig, UpdateSeq, PurgeSeq, SeqIndexed, KeySeqIndexed, Args}),
     couch_index_util:hexsig(couch_util:md5(Bin)).
 
 
@@ -202,7 +202,12 @@ init_state(Db, Fd, State, #index_header{
         view_states=[{Bt, nil, nil, USeq, PSeq} || {Bt, USeq, PSeq} <- ViewStates]
         });
 init_state(Db, Fd, State, Header) ->
-    #mrst{language=Lang, views=Views, seq_indexed=SeqIndexed} = State,
+    #mrst{
+        language=Lang,
+        views=Views,
+        keyseq_indexed=KeySeqIndexed,
+        seq_indexed=SeqIndexed
+    } = State,
     #mrheader{
         seq=Seq,
         purge_seq=PurgeSeq,
@@ -219,7 +224,7 @@ init_state(Db, Fd, State, Header) ->
 
     IdBtOpts = [{compression, couch_db:compression(Db)}],
     {ok, IdBtree} = couch_btree:open(IdBtreeState, Fd, IdBtOpts),
-    {ok, LogBtree} = case SeqIndexed of
+    {ok, LogBtree} = case SeqIndexed orelse KeySeqIndexed of
         true -> couch_btree:open(LogBtreeState, Fd, IdBtOpts);
         false -> {ok, nil}
     end,
@@ -653,7 +658,6 @@ reset_state(State) ->
     State#mrst{
         fd=nil,
         qserver=nil,
-        log_indexed=State#mrst.log_indexed,
         seq_indexed=State#mrst.seq_indexed,
         keyseq_indexed=State#mrst.keyseq_indexed,
         update_seq=0,
@@ -748,8 +752,10 @@ changes_key_opts(StartSeq, #mrargs{keys=Keys, direction=Dir}=Args, Extra) ->
     end, Keys).
 
 
-changes_skey_opts(StartSeq, #mrargs{start_key=undefined}) ->
+changes_skey_opts(StartSeq, #mrargs{start_key=undefined, start_key_docid=undefined}) ->
     [{start_key, [<<>>, StartSeq+1]}];
+changes_skey_opts(StartSeq, #mrargs{start_key=undefined, start_key_docid=SKeyDocId}) ->
+    [{start_key, {[<<>>, StartSeq+1], SKeyDocId}}];
 changes_skey_opts(StartSeq, #mrargs{start_key=SKey,
                                     start_key_docid=SKeyDocId}) ->
     [{start_key, {[SKey, StartSeq+1], SKeyDocId}}].
