@@ -38,27 +38,49 @@ get(Property, State) ->
             Opts = State#mrst.design_opts,
             IncDesign = couch_util:get_value(<<"include_design">>, Opts, false),
             LocalSeq = couch_util:get_value(<<"local_seq">>, Opts, false),
+            SeqIndexed = couch_util:get_value(<<"seq_indexed">>, Opts, false),
+            KeySeqIndexed = couch_util:get_value(<<"keyseq_indexed">>, Opts, false),
             if IncDesign -> [include_design]; true -> [] end
-                ++ if LocalSeq -> [local_seq]; true -> [] end;
+                ++ if LocalSeq -> [local_seq]; true -> [] end
+                ++ if SeqIndexed -> [seq_indexed]; true -> [] end
+                ++ if KeySeqIndexed -> [keyseq_indexed]; true -> [] end;
         info ->
             #mrst{
                 fd = Fd,
                 sig = Sig,
-                id_btree = Btree,
+                id_btree = IdBtree,
+                log_btree = LogBtree,
                 language = Lang,
                 update_seq = UpdateSeq,
                 purge_seq = PurgeSeq,
-                views = Views
+                views = Views,
+                design_opts = Opts
             } = State,
             {ok, Size} = couch_file:bytes(Fd),
-            {ok, DataSize} = couch_mrview_util:calculate_data_size(Btree,Views),
+            {ok, DataSize} = couch_mrview_util:calculate_data_size(IdBtree,
+                                                                   LogBtree,
+                                                                   Views),
+
+
+            IncDesign = couch_util:get_value(<<"include_design">>, Opts, false),
+            LocalSeq = couch_util:get_value(<<"local_seq">>, Opts, false),
+            SeqIndexed = couch_util:get_value(<<"seq_indexed">>, Opts, false),
+            KeySeqIndexed = couch_util:get_value(<<"keyseq_indexed">>, Opts, false),
+            UpdateOptions =
+                if IncDesign -> [<<"include_design">>]; true -> [] end
+                ++ if LocalSeq -> [<<"local_seq">>]; true -> [] end
+                ++ if SeqIndexed -> [<<"seq_indexed">>]; true -> [] end
+                ++ if KeySeqIndexed -> [<<"keyseq_indexed">>]; true -> [] end,
+
+
             {ok, [
                 {signature, list_to_binary(couch_index_util:hexsig(Sig))},
                 {language, Lang},
                 {disk_size, Size},
                 {data_size, DataSize},
                 {update_seq, UpdateSeq},
-                {purge_seq, PurgeSeq}
+                {purge_seq, PurgeSeq},
+                {update_options, UpdateOptions}
             ]};
         Other ->
             throw({unknown_index_property, Other})
@@ -75,15 +97,39 @@ open(Db, State) ->
         sig=Sig
     } = State,
     IndexFName = couch_mrview_util:index_file(DbName, Sig),
+
+    % If we are upgrading from <=1.2.x, we upgrade the view
+    % index file on the fly, avoiding an index reset.
+    %
+    % OldSig is `ok` if no upgrade happened.
+    %
+    % To remove support for 1.2.x auto-upgrades in the
+    % future, just remove the next line and the code
+    % between "upgrade code for <= 1.2.x" and
+    % "end upgrade code for <= 1.2.x" and the corresponding
+    % code in couch_mrview_util
+
+    OldSig = couch_mrview_util:maybe_update_index_file(State),
+
     case couch_mrview_util:open_file(IndexFName) of
         {ok, Fd} ->
             case (catch couch_file:read_header(Fd)) of
-                {ok, {Sig, Header}} ->
+                % upgrade code for <= 1.2.x
+                {ok, {OldSig, Header}} ->
                     % Matching view signatures.
                     NewSt = couch_mrview_util:init_state(Db, Fd, State, Header),
                     {ok, NewSt#mrst{fd_monitor=erlang:monitor(process, Fd)}};
+                % end of upgrade code for <= 1.2.x
+                {ok, {Sig, Header}} ->
+                    % Matching view signatures.
+                    NewSt = couch_mrview_util:init_state(Db, Fd, State, Header),
+                    %{ok, RefCounter} = couch_ref_counter:start([Fd]),
+                    %{ok, NewSt#mrst{refc=RefCounter}};
+                    {ok, NewSt#mrst{fd_monitor=erlang:monitor(process, Fd)}};
                 _ ->
                     NewSt = couch_mrview_util:reset_index(Db, Fd, State),
+                    %{ok, RefCounter} = couch_ref_counter:start([Fd]),
+                    %{ok, NewSt#mrst{refc=RefCounter}}
                     {ok, NewSt#mrst{fd_monitor=erlang:monitor(process, Fd)}}
             end;
         {error, Reason} = Error ->

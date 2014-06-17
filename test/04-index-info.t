@@ -15,8 +15,18 @@
 
 main(_) ->
     test_util:run(9, fun() -> test() end).
+    etap:plan(12),
+    case (catch test()) of
+        ok ->
+            etap:end_tests();
+        Other ->
+            etap:diag(io_lib:format("Test died abnormally: ~p", [Other])),
+            etap:bail(Other)
+    end,
+    timer:sleep(300),
+    ok.
 
-sig() -> <<"276df562b152b3c4e5d34024f62672ed">>.
+sig() -> <<"fdf04ef29c4a471f150acad075bdf47f">>.
 
 test() ->
     test_util:start_couch(),
@@ -36,6 +46,18 @@ test() ->
     etap:is(getval(compact_running, Info), false, "No compaction running."),
     etap:is(getval(waiting_clients, Info), 0, "No waiting clients."),
 
+<<<<<<< HEAD
+=======
+
+    {ok, ViewInfo} = couch_mrview:get_view_info(Db, <<"_design/bar">>,
+                                           <<"baz">>),
+    etap:is(getval(update_seq, ViewInfo), 11, "View Update seq is ok."),
+    etap:is(getval(purge_seq, ViewInfo), 0, "View Update seq is ok."),
+    etap:is(getval(total_rows, ViewInfo), 10, "View total rows is ok."),
+
+
+    test_util:stop_couch(),
+>>>>>>> 916e1b3... couch_mrview: add API to retrieve view info.
     ok.
 
 getval(Key, PL) ->
